@@ -1,0 +1,28 @@
+langchain==0.1.20
+langchain-community==0.0.38
+
+# FIX 1: faiss-cpu 1.7.4 doesn't exist on PyPI — 1.9.0+ has a compatible API
+faiss-cpu>=1.9.0
+
+# FIX 2: torch 2.2.0 has no Python 3.13 wheels — 2.5.0+ supports Python 3.13
+torch>=2.5.0
+
+# FIX 3: transformers 4.40.0 may have issues on Python 3.13 — use 4.44+
+transformers>=4.44.0
+sentence-transformers>=2.7.0
+
+# scispacy + en_core_sci_lg: installed via conda, NOT here (see setup commands below)
+# scispacy 0.5.4 pins scipy<1.11 which has no Python 3.12 pip wheels.
+# Conda has pre-built scipy binaries — use: conda install -c conda-forge scispacy
+
+ragas==0.1.9
+fastapi==0.110.0
+uvicorn==0.27.0
+streamlit==1.32.0
+pyyaml==6.0.1
+pydantic>=2.9.0        # 2.6.0 has broken pydantic.v1 on Python 3.12 (ForwardRef bug); fixed in 2.9+
+datasets==2.18.0
+pytest==8.1.0
+pandas>=2.2.0          # 2.2.0 has Python 3.12 wheels (no longer need 2.2.3+)
+numpy>=1.26.4,<2       # langchain==0.1.20 requires numpy<2; 1.26.4 has Python 3.12 wheels
+requests==2.31.0

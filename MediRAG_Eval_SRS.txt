@@ -1,0 +1,1281 @@
+================================================================================
+SOFTWARE REQUIREMENTS SPECIFICATION
+MediRAG-Eval — Hallucination Detection & Evaluation Framework
+for RAG-Based Medical QA Systems
+Version 1.4 | March 2026
+================================================================================
+CHANGELOG v1.4 (on top of v1.3)
+  [IMPORTANT] FR-20 updated: query_rxnorm replaced with single approximateTerm
+              API call (was 2 calls/drug). Runtime ~24 min instead of ~47 min.
+  [IMPORTANT] Section 16 updated: warmup_deberta() clarified as throw-away
+              verification instance (main pipeline uses shared singleton).
+  [IMPORTANT] Section 16 updated: warmup_save_fallback() added — warmup.py
+              now auto-generates demo/demo_fallback.json.
+  [MINOR]     Directory structure: src/evaluate.py added as orchestrator.
+  [MINOR]     Directory structure: pytest.ini and .gitattributes added.
+  [MINOR]     Section 17 added: pytest.ini and .gitattributes full specs.
+================================================================================
+CUMULATIVE GAP CLOSURE
+  v1.0 → v1.1 : 12 gaps fixed
+  v1.1 → v1.2 :  9 gaps fixed
+  v1.2 → v1.3 :  6 gaps fixed
+  v1.3 → v1.4 :  6 gaps fixed
+  Total        : 33 gaps resolved across all versions
+================================================================================
+
+Team: MediRAG
+Team Lead: Alapan Sen
+Members: Mohammed Afaan, Abhirup Karmakar, Bikram Sardar, Joydeep Das
+Affiliation: Amity University Kolkata, B.Tech CSE 2026
+Hackathon: India Innovates 2026 — Bharat Mandapam, March 28
+Major Project Deadline: May 2026
+Supervisor: Dr. Nilanjana Dutta Roy
+
+================================================================================
+1. INTRODUCTION
+================================================================================
+
+1.1 PURPOSE
+-----------
+This SRS is the authoritative reference for all MediRAG-Eval development,
+testing, and evaluation activities. It is complete — a developer can implement
+any module from this document alone without asking clarifying questions.
+
+Demo scope (March 28): RAG backbone + Module 1 + RAGAS + Dashboard.
+Full scope (May): All 5 modules + API + ablations + full report.
+
+1.2 SCOPE
+---------
+MediRAG-Eval is a Python-based post-generation audit layer that:
+- Receives : user query + retrieved context chunks + LLM-generated answer
+- Produces : Hallucination Risk Score (0-100) + JSON audit report + Streamlit UI
+
+It does NOT replace a medical QA system. It audits one.
+It does NOT provide medical advice.
+
+1.3 KEY DEFINITIONS
+-------------------
+RAG              Retrieval-Augmented Generation
+Hallucination    Generated claim not supported by or contradicting retrieved context
+Faithfulness     Degree to which every claim is entailed by retrieved context
+NLI              Natural Language Inference (Entailment / Neutral / Contradiction)
+NER              Named Entity Recognition
+HRS              Hallucination Risk Score (0-100)
+FAISS            Facebook AI Similarity Search
+SciSpaCy         Allen AI biomedical NER library
+RAGAS            Retrieval Augmented Generation Assessment
+DeBERTa          cross-encoder/nli-deberta-v3-base
+BioBERT          dmis-lab/biobert-v1.1
+Atomic Claim     Single indivisible verifiable assertion from a sentence
+Chunk Metadata   Structured fields stored alongside each FAISS vector (FR-03b)
+RxCUI            RxNorm Concept Unique Identifier — canonical drug ID
+Cold Start       First inference call after process launch (model loading delay)
+
+================================================================================
+2. SYSTEM OVERVIEW
+================================================================================
+
+2.1 ARCHITECTURE DECISIONS (LOCKED)
+-------------------------------------
+Vector store    : FAISS only.
+LLM             : Mistral-7B via Ollama (judging + generation, separate temps).
+Embeddings      : BioBERT for retrieval AND RAGAS answer_relevancy.
+Drug norm       : RxNorm REST (3s timeout) → local CSV cache fallback.
+Tier classifier : Keyword-based (demo), metadata-based (May).
+
+2.2 DEMO SCOPE vs FULL SCOPE
+-----------------------------
+Module                                  | March 28    | May Full
+----------------------------------------|-------------|----------
+RAG Backbone (LangChain+FAISS+BioBERT)  | REQUIRED    | REQUIRED
+Module 1: Faithfulness (DeBERTa NLI)    | REQUIRED    | REQUIRED
+Module 2: Entity Verifier (SciSpaCy)    | Partial ok  | REQUIRED
+Module 3: Source Credibility Ranker     | Partial ok  | REQUIRED
+Module 4: Contradiction Detector        | Static ok   | REQUIRED
+RAGAS Integration                       | REQUIRED    | REQUIRED
+FastAPI REST Endpoint                   | Not needed  | REQUIRED
+Streamlit Dashboard                     | REQUIRED    | REQUIRED
+Warmup script (warmup.py)               | REQUIRED    | REQUIRED
+Ablations & Results                     | Not needed  | REQUIRED
+
+================================================================================
+3. FUNCTIONAL REQUIREMENTS
+================================================================================
+
+--- RAG BACKBONE ---
+
+FR-01: DOCUMENT INGESTION
+Ingest and index from:
+- PubMed Open Access Corpus (FTP — free)
+- BioASQ 2023 (bioasq.org — free registration)
+- MedQA-USMLE (GitHub: jind11/MedQA — free)
+- PubMedQA (HuggingFace: pubmed_qa — free)
+
+FR-02: DOCUMENT CHUNKING
+- Chunk size: 512 tokens, overlap: 50 tokens
+- Chunker: LangChain RecursiveCharacterTextSplitter
+
+FR-03: EMBEDDING GENERATION
+- Model: dmis-lab/biobert-v1.1 (768-dim dense vectors)
+- Same model for documents and queries
+
+FR-03b: CHUNK METADATA SCHEMA
+Parallel dict alongside FAISS index, saved as pickle:
+  metadata_store: dict[int, dict]   # key = FAISS integer index
+
+  {
+    "chunk_id":     str,   # uuid4
+    "doc_id":       str,   # PubMed PMID or dataset row ID
+    "source":       str,   # "pubmed"|"bioasq"|"medqa"|"pubmedqa"
+    "title":        str,
+    "pub_type":     str,   # see FR-11b
+    "pub_year":     int,   # 0 if unknown
+    "journal":      str,   # "" if unknown
+    "chunk_index":  int,
+    "total_chunks": int
+  }
+
+pub_type extraction:
+  PubMed:   <PublicationType> from XML
+  BioASQ:   "type" field from JSON metadata
+  MedQA:    hardcode "exam_question"
+  PubMedQA: hardcode "research_abstract"
+
+FR-04: VECTOR RETRIEVAL
+- Default top-k: 5 (config: retrieval.top_k)
+- FAISS IndexFlatIP with L2-normalized vectors (= cosine similarity)
+- Returns: list of (chunk_text: str, metadata: dict, score: float)
+
+--- MODULE 1: FAITHFULNESS SCORER ---
+
+FR-05: CLAIM DECOMPOSITION
+Model: Mistral-7B via Ollama, temperature: judge_temperature (0.0)
+
+EXACT PROMPT TEMPLATE:
+----PROMPT START----
+You are a medical claim extractor. Decompose the following medical answer into
+atomic, verifiable claims. Each claim must:
+1. Be a single sentence with exactly one verifiable assertion
+2. Be self-contained
+3. Not include hedging phrases unless clinically significant
+4. Not duplicate another claim
+
+Return ONLY a JSON array of strings. No explanation, no markdown, no preamble.
+Example: ["Metformin treats Type 2 Diabetes.",
+          "Standard starting dose of Metformin is 500mg twice daily.",
+          "Metformin is contraindicated in patients with eGFR below 30."]
+
+Medical Answer:
+{answer}
+----PROMPT END----
+
+Parse: strip markdown backticks → json.loads()
+Fallback on parse failure: answer.split(". ")
+Log parse failures at WARNING.
+
+FR-06: NLI ENTAILMENT CHECK
+Model: cross-encoder/nli-deberta-v3-base, batch_size from config
+
+Token truncation (512 limit):
+  claim_ids = tok(claim, add_special_tokens=False)["input_ids"]
+  max_ctx   = 510 - len(claim_ids)
+  ctx_ids   = tok(context, add_special_tokens=False)["input_ids"][-max_ctx:]
+
+Classification:
+  ENTAILED     — max entailment score across all chunks >= 0.75
+  CONTRADICTED — max contradiction score >= 0.75
+  NEUTRAL      — neither threshold met
+
+On CUDA OOM: retry with batch_size=1, log WARNING.
+
+FR-07: FAITHFULNESS SCORE
+  Faithfulness = |ENTAILED| / |total claims|
+  Empty answer → 0.0, log WARNING.
+
+--- MODULE 2: MEDICAL ENTITY VERIFIER ---
+
+FR-08: ENTITY EXTRACTION
+Model: SciSpaCy en_core_sci_lg
+Types: DRUG (T121/T195/T200), DOSAGE (digit+unit regex), CONDITION (T047/T184)
+Dosage regex: r'\b\d+\.?\d*\s*(mg|mcg|ml|g|IU|units|mmol|mEq)\b'
+
+FR-09: ENTITY MISMATCH DETECTION
+Drug normalization:
+  1. RxNorm REST (3s timeout): rxnav.nlm.nih.gov/REST/rxcui.json?name={name}&search=1
+  2. On failure: lookup in data/rxnorm_cache.csv (exact then lowercase)
+  3. On cache miss: use raw drug_name, log WARNING
+
+Severity (apply in priority order):
+  CRITICAL:
+    a) DOSAGE numerical value differs > 10% from context
+    b) DRUG not found in any retrieved chunk after normalization
+    c) DRUG appears in context as "contraindicated"/"avoid"/"not for use in"
+       but answer recommends it
+  MODERATE:
+    a) DRUG in different semantic role in context vs answer
+    b) CONDITION not in any chunk
+  MINOR: terminology/abbreviation mismatches
+
+Dosage tolerance: abs(answer - context) / context > 0.10 → CRITICAL
+Incompatible units → MODERATE, log DEBUG.
+
+FR-10: ENTITY ACCURACY SCORE
+  Entity Accuracy = |verified| / |total extracted|
+
+--- MODULE 3: SOURCE CREDIBILITY RANKER ---
+
+FR-11a: KEYWORD-BASED (demo)
+  Tier 1: "randomized controlled trial","randomised controlled trial","rct",
+          "systematic review","meta-analysis","cochrane"
+  Tier 2: "clinical guideline","who guideline","nih guideline","icmr",
+          "practice guideline","consensus statement"
+  Tier 3: "cohort study","observational study","prospective study",
+          "retrospective study","cross-sectional"
+  Tier 4: "case report","case study","case series"
+  Default: Tier 5
+
+FR-11b: METADATA-BASED (May)
+  "randomized-controlled-trial" → 1 | "systematic-review" → 1
+  "meta-analysis" → 1           | "practice-guideline" → 2
+  "consensus-development" → 2   | "journal-article" → 3
+  "observational-study" → 3     | "case-reports" → 4
+  "letter" → 4                  | "editorial" → 4
+  "exam_question" → 5           | "research_abstract" → 3
+  anything else → 5
+
+FR-12: SOURCE CREDIBILITY SCORE
+  tier_weights = {1:1.00, 2:0.85, 3:0.65, 4:0.40, 5:0.20}
+  Source Credibility = mean(tier_weights[tier] for each chunk)
+
+--- MODULE 4: CONTRADICTION DETECTOR ---
+
+FR-13: CROSS-SENTENCE CONSISTENCY
+Model: cross-encoder/nli-deberta-v3-base (reuse loaded instance from Module 1)
+Apply same 512-token truncation as FR-06.
+N > 10 sentences: check adjacent pairs + (first, last) only.
+Flag pairs with CONTRADICTION confidence > 0.75.
+
+FR-14: CONTRADICTION RISK SCORE
+  Contradiction Risk = |contradicted pairs| / |total checked pairs|
+
+--- RAGAS INTEGRATION ---
+
+FR-15: RAGAS METRICS
+LLM judge: Mistral-7B via Ollama (temperature: 0.0)
+Embeddings: BioBERT via HuggingFaceEmbeddings (NOT OllamaEmbeddings)
+
+Integration:
+  from langchain_community.chat_models import ChatOllama
+  from langchain_community.embeddings import HuggingFaceEmbeddings
+  from ragas import evaluate
+  from ragas.metrics import (faithfulness, answer_relevancy,
+                              context_precision, context_recall)
+  from ragas.llms import LangchainLLMWrapper
+  from ragas.embeddings import LangchainEmbeddingsWrapper
+
+  llm = ChatOllama(model="mistral", base_url="http://localhost:11434",
+                   temperature=0.0)
+  ragas_llm = LangchainLLMWrapper(llm)
+
+  hf_emb = HuggingFaceEmbeddings(
+      model_name="dmis-lab/biobert-v1.1",
+      model_kwargs={"device": "cpu"},
+      encode_kwargs={"normalize_embeddings": True}
+  )
+  ragas_emb = LangchainEmbeddingsWrapper(hf_emb)
+
+  for metric in [faithfulness, answer_relevancy, context_precision,
+                 context_recall]:
+      metric.llm = ragas_llm
+  answer_relevancy.embeddings = ragas_emb
+
+context_recall ground_truth:
+  PubMedQA: row["long_answer"]
+  MedQA:    row["answer"] (correct option text)
+  BioASQ:   row["ideal_answer"]
+  Unknown:  skip context_recall, report as null, log WARNING
+  NEVER pass "" as ground_truth — causes division by zero.
+
+  metrics = [faithfulness, answer_relevancy, context_precision]
+  if ground_truth:
+      metrics.append(context_recall)
+
+--- SCORE AGGREGATION ---
+
+FR-16: HALLUCINATION RISK SCORE
+  weighted = (0.40 × Faithfulness) + (0.25 × EntityAccuracy)
+           + (0.20 × SourceCredibility) + (0.15 × (1 - ContradictionRisk))
+  HRS = round(100 × (1 - weighted))
+  Bands: 0-30 LOW, 31-60 MODERATE, 61-85 HIGH, 86-100 CRITICAL
+
+FR-17: JSON OUTPUT
+  {
+    "query": "...",
+    "generated_answer": "...",
+    "hallucination_risk_score": 67,
+    "risk_band": "HIGH RISK",
+    "scores": {
+      "faithfulness": 0.45,
+      "entity_accuracy": 0.60,
+      "source_credibility": 0.80,
+      "contradiction_risk": 0.28
+    },
+    "ragas_scores": {
+      "faithfulness": 0.45,
+      "answer_relevancy": 0.72,
+      "context_precision": 0.68,
+      "context_recall": null
+    },
+    "clause_annotations": [...],
+    "flagged_entities": [...],
+    "source_tiers": [...],
+    "errors": []
+  }
+
+FR-18: REST ENDPOINT
+  POST /evaluate
+    query:            str, min=5, max=500
+    retrieved_chunks: list[str], min=1, max=10, each max=2000
+    generated_answer: str, min=10, max=2000
+    ground_truth:     str | None = None
+  GET /health → {"status":"ok","ollama":true/false}
+  Validation errors → HTTP 422. Module timeout → partial results, no 500.
+
+FR-19: STREAMLIT DASHBOARD
+  Panels: HRS gauge, per-module bars, clause annotations,
+          flagged entity table, chunk viewer, raw JSON expander.
+
+FR-20: build_rxnorm_cache.py [NEW — fixes Gap #1]
+------------------------------------------------------
+Full specification for the offline drug normalization cache builder.
+
+PURPOSE:
+  Read DrugBank Open Data XML → extract all drug names and synonyms →
+  query RxNorm REST API for each → save to data/rxnorm_cache.csv
+
+INPUT:
+  --drugbank-xml : path to DrugBank Open Data XML file
+                   (default: data/raw/drugbank_open_data.xml)
+  --output-csv   : path for output CSV
+                   (default: data/rxnorm_cache.csv)
+  --delay        : seconds between API calls (default: 0.1)
+                   RxNorm is free but rate-limit courtesy applies
+
+OUTPUT CSV SCHEMA:
+  drug_name      : str  — drug name or synonym as appears in DrugBank XML
+  rxcui          : str  — RxNorm concept ID ("" if not found)
+  canonical_name : str  — RxNorm preferred name ("" if not found)
+
+IMPLEMENTATION SPEC:
+
+  import xml.etree.ElementTree as ET
+  import requests, csv, time, argparse, logging
+
+  RXNORM_URL = "https://rxnav.nlm.nih.gov/REST/rxcui.json"
+  NS = {"db": "http://www.drugbank.ca"}   # DrugBank XML namespace
+
+  def extract_drug_names(xml_path: str) -> list[str]:
+      """Extract all drug names and synonyms from DrugBank Open Data XML."""
+      tree = ET.parse(xml_path)
+      root = tree.getroot()
+      names = set()
+      for drug in root.findall("db:drug", NS):
+          # Primary name
+          name_el = drug.find("db:name", NS)
+          if name_el is not None and name_el.text:
+              names.add(name_el.text.strip())
+          # Synonyms
+          for syn in drug.findall("db:synonyms/db:synonym", NS):
+              if syn.text:
+                  names.add(syn.text.strip())
+          # International brands
+          for brand in drug.findall("db:international-brands/db:international-brand/db:name", NS):
+              if brand.text:
+                  names.add(brand.text.strip())
+      return sorted(names)
+
+  # FIX v1.4: use /approximateTerm — returns rxcui AND name in ONE call.
+  # Previous 2-call approach (rxcui lookup + name lookup) doubled API traffic.
+  RXNORM_APPROX_URL = "https://rxnav.nlm.nih.gov/REST/approximateTerm.json"
+
+  def query_rxnorm(drug_name: str, timeout: int = 5) -> tuple[str, str]:
+      """Returns (rxcui, canonical_name). Returns ("", "") on failure.
+      Uses /approximateTerm — single HTTP call (option=1 = normalize spelling)."""
+      try:
+          r = requests.get(RXNORM_APPROX_URL,
+                           params={"term": drug_name, "maxEntries": "1",
+                                   "option": "1"},
+                           timeout=timeout)
+          if r.status_code != 200:
+              return "", ""
+          candidates = (r.json()
+                        .get("approximateGroup", {})
+                        .get("candidate", []))
+          if not candidates:
+              return "", ""
+          rxcui = candidates[0].get("rxcui", "")
+          name  = candidates[0].get("name", drug_name)  # fallback to input
+          return rxcui, name
+      except Exception:
+          return "", ""
+
+  def main():
+      parser = argparse.ArgumentParser()
+      parser.add_argument("--drugbank-xml", default="data/raw/drugbank_open_data.xml")
+      parser.add_argument("--output-csv",   default="data/rxnorm_cache.csv")
+      parser.add_argument("--delay",        type=float, default=0.1)
+      args = parser.parse_args()
+
+      names = extract_drug_names(args.drugbank_xml)
+      logging.info(f"Extracted {len(names)} drug names from DrugBank XML")
+
+      with open(args.output_csv, "w", newline="", encoding="utf-8") as f:
+          writer = csv.writer(f)
+          writer.writerow(["drug_name", "rxcui", "canonical_name"])
+          for i, name in enumerate(names):
+              rxcui, canonical = query_rxnorm(name)
+              writer.writerow([name, rxcui, canonical])
+              if i % 100 == 0:
+                  logging.info(f"Progress: {i}/{len(names)}")
+              time.sleep(args.delay)
+
+      logging.info(f"Cache saved to {args.output_csv}")
+
+  if __name__ == "__main__":
+      logging.basicConfig(level=logging.INFO)
+      main()
+
+RUNTIME ESTIMATE:
+  ~14,000 drug names × 0.1s delay × 1 API call each ≈ ~24 minutes  [FIXED v1.4]
+  Can be run during the day before demo (not just overnight).
+  Do NOT run during active demo prep.
+
+RETRY LOGIC:
+  query_rxnorm() returns ("", "") on any failure — no retry needed.
+  The entity_verifier will handle cache misses gracefully (FR-09).
+
+USAGE:
+  python scripts/build_rxnorm_cache.py
+  python scripts/build_rxnorm_cache.py --drugbank-xml /path/to/file.xml
+  python scripts/build_rxnorm_cache.py --delay 0.2   # slower, more polite
+
+--- MODULE 1/4: SHARED MODEL LOADING ---
+
+DeBERTa is used by both Module 1 and Module 4.
+Load ONCE at application startup and pass the instance to both modules.
+Do NOT load it separately in each module class — this doubles memory usage.
+
+In the main evaluation orchestrator (evaluate.py or api/main.py):
+  from transformers import pipeline as hf_pipeline
+  nli_pipeline = hf_pipeline(
+      "text-classification",
+      model="cross-encoder/nli-deberta-v3-base",
+      device=-1,        # CPU; change to 0 for GPU
+      batch_size=config.modules.faithfulness.deberta_batch_size
+  )
+  faithfulness_module    = FaithfulnessScorer(nli_pipeline, config)
+  contradiction_module   = ContradictionDetector(nli_pipeline, config)
+
+--- RAGAS (FR-15) ---
+See Section 3, FR-15.
+
+--- SCORE AGGREGATION (FR-16) ---
+Weights configurable in config.yaml aggregator.weights.
+
+================================================================================
+4. NON-FUNCTIONAL REQUIREMENTS
+================================================================================
+
+4.1 PERFORMANCE
+  End-to-end:     < 30s (CPU, k=5, after warmup)
+  FAISS retrieval: < 2s
+  DeBERTa NLI:    < 10s
+  SciSpaCy NER:   < 3s
+  RAGAS:          < 15s (after Mistral warm)
+  Dashboard load: < 5s
+  Warmup script:  < 60s (acceptable — run before demo)
+
+4.2 RELIABILITY
+  - Partial results always returned on module failure
+  - All scores clipped to [0.0, 1.0]
+  - RxNorm offline fallback to CSV cache (FR-09, FR-20)
+  - DeBERTa OOM retry at batch_size=1
+  - Claim decomposition JSON parse fallback to sentence split
+
+4.3 PORTABILITY
+  - Runs on Colab free tier (T4 GPU)
+  - Runs on CPU-only 16GB RAM machine
+  - No internet required at runtime (after setup)
+  - Works on Windows, macOS, Linux (see Section 9.2 for OS-specific setup)
+
+4.4 MAINTAINABILITY
+  - One class per module file
+  - All parameters in config.yaml
+  - EvalResult dataclass with defined details shape (see base.py spec below)
+  - Unit tests for all 5 modules
+
+================================================================================
+5. base.py — EvalResult DATACLASS (v1.3 UPDATED)
+================================================================================
+
+Each module returns an EvalResult. The details dict shape is now fully
+specified per module so dashboard developers know exactly what keys to expect.
+
+  from dataclasses import dataclass, field
+
+  @dataclass
+  class EvalResult:
+      module_name : str
+      score       : float           # always [0.0, 1.0]
+      details     : dict            # shape defined per module below
+      error       : str | None      # None if successful
+      latency_ms  : int
+
+DETAILS SHAPE PER MODULE:
+
+faithfulness.details:
+  {
+    "total_claims": int,
+    "entailed_count": int,
+    "neutral_count": int,
+    "contradicted_count": int,
+    "claims": [
+      {
+        "claim": str,
+        "status": "ENTAILED" | "NEUTRAL" | "CONTRADICTED",
+        "best_chunk_id": str,          # chunk with highest NLI score
+        "nli_score": float
+      }
+    ]
+  }
+
+entity_verifier.details:
+  {
+    "total_entities": int,
+    "verified_count": int,
+    "flagged_count": int,
+    "entities": [
+      {
+        "entity": str,
+        "type": "DRUG" | "DOSAGE" | "CONDITION" | "PROCEDURE",
+        "status": "VERIFIED" | "FLAGGED" | "NOT_FOUND",
+        "severity": "CRITICAL" | "MODERATE" | "MINOR" | null,
+        "answer_value": str,
+        "context_value": str | null,
+        "rxcui": str | null           # RxNorm ID if resolved
+      }
+    ]
+  }
+
+source_credibility.details:
+  {
+    "method_used": "keyword" | "metadata",
+    "chunks": [
+      {
+        "chunk_id": str,
+        "tier": int,                   # 1-5
+        "tier_weight": float,
+        "pub_type": str,
+        "title": str,
+        "matched_keyword": str | null  # which keyword triggered tier (FR-11a)
+      }
+    ]
+  }
+
+contradiction.details:
+  {
+    "total_sentences": int,
+    "checked_pairs": int,
+    "contradicted_pairs": int,
+    "pairs": [
+      {
+        "sentence_a": str,
+        "sentence_b": str,
+        "contradiction_score": float,
+        "flagged": bool
+      }
+    ]
+  }
+
+aggregator.details:
+  {
+    "weights_used": {
+      "faithfulness": float,
+      "entity_accuracy": float,
+      "source_credibility": float,
+      "contradiction_risk": float
+    },
+    "weighted_composite": float,
+    "component_contributions": {
+      "faithfulness_contribution": float,
+      "entity_contribution": float,
+      "source_contribution": float,
+      "contradiction_contribution": float
+    }
+  }
+
+NOTE for dashboard (app.py): access details using these exact keys.
+Example:
+  faith_result = evaluate_faithfulness(query, chunks, answer)
+  for claim in faith_result.details["claims"]:
+      status = claim["status"]    # "ENTAILED" | "NEUTRAL" | "CONTRADICTED"
+      text   = claim["claim"]
+
+================================================================================
+6. TECHNOLOGY STACK (ALL FREE)
+================================================================================
+
+CATEGORY              | TOOL                          | VERSION
+----------------------|-------------------------------|---------------------------
+Language              | Python                        | 3.11
+RAG Framework         | LangChain                     | 0.1.20
+LangChain Community   | langchain-community           | 0.0.38
+Vector Store          | FAISS (only)                  | faiss-cpu 1.7.4
+Embeddings            | BioBERT (HuggingFaceEmbeddings)| dmis-lab/biobert-v1.1
+NLI Model             | DeBERTa-v3                    | cross-encoder/nli-deberta-v3-base
+Biomedical NER        | SciSpaCy                      | en_core_sci_lg 0.5.4
+RAG Evaluation        | RAGAS                         | 0.1.9
+LLM (all roles)       | Mistral-7B via Ollama         | ollama.ai (local, free)
+API                   | FastAPI + Uvicorn             | 0.110.0 / 0.27.0
+Dashboard             | Streamlit                     | 1.32.0
+Drug Norm             | RxNorm REST + CSV cache       | NIH (free)
+Drug Data             | DrugBank Open Data XML        | free academic reg
+Eval Dataset 1        | PubMedQA                      | HuggingFace: pubmed_qa
+Eval Dataset 2        | MedQA-USMLE                   | GitHub: jind11/MedQA
+Eval Dataset 3        | BioASQ 2023                   | bioasq.org
+Config                | PyYAML                        | pip
+Testing               | pytest                        | pip
+Logging               | Python stdlib logging         | built-in
+
+================================================================================
+7. PROJECT DIRECTORY STRUCTURE
+================================================================================
+
+medirag_eval/
+├── config.yaml
+├── requirements.txt
+├── README.md
+├── .gitignore                         # see Section 15 for correct pattern
+├── .gitattributes                     # line-ending rules — see Section 17  [NEW v1.4]
+├── pytest.ini                         # pytest config — see Section 17      [NEW v1.4]
+│
+├── data/
+│   ├── raw/                           # DO put in .gitignore
+│   ├── processed/                     # DO put in .gitignore
+│   ├── index/                         # DO NOT put in .gitignore (see Section 15)
+│   │   ├── faiss.index
+│   │   └── metadata_store.pkl
+│   └── rxnorm_cache.csv               # ~1MB, commit directly to repo
+│
+├── scripts/
+│   ├── build_rxnorm_cache.py          # FR-20 — run once before demo
+│   └── warmup.py                      # Section 16 — run before demo
+│
+├── src/
+│   ├── __init__.py                    # logging setup
+│   ├── evaluate.py                    # evaluation orchestrator [NEW v1.4]
+│   │                                  # loads DeBERTa ONCE, passes instance to
+│   │                                  # FaithfulnessScorer + ContradictionDetector
+│   │                                  # exposes run_evaluation(query) -> dict (FR-17)
+│   ├── pipeline/
+│   │   ├── ingest.py
+│   │   ├── chunker.py
+│   │   ├── embedder.py
+│   │   └── retriever.py
+│   ├── modules/
+│   │   ├── base.py                    # EvalResult dataclass (full spec above)
+│   │   ├── faithfulness.py
+│   │   ├── entity_verifier.py
+│   │   ├── source_credibility.py
+│   │   └── contradiction.py
+│   ├── evaluation/
+│   │   ├── ragas_eval.py
+│   │   └── aggregator.py
+│   ├── api/
+│   │   ├── main.py
+│   │   └── schemas.py
+│   └── dashboard/
+│       └── app.py
+│
+├── tests/
+│   ├── test_faithfulness.py
+│   ├── test_entity_verifier.py
+│   ├── test_source_credibility.py
+│   ├── test_contradiction.py
+│   ├── test_aggregator.py
+│   └── test_api.py
+│
+├── demo/
+│   └── demo_fallback.json             # pre-computed output for demo day
+│
+└── notebooks/
+    ├── 01_data_prep.ipynb
+    ├── 02_module_dev.ipynb
+    └── 03_evaluation.ipynb
+
+================================================================================
+8. config.yaml (v1.3)
+================================================================================
+
+retrieval:
+  top_k: 5
+  chunk_size: 512
+  chunk_overlap: 50
+  embedding_model: dmis-lab/biobert-v1.1
+  index_path: data/index/faiss.index
+  metadata_path: data/index/metadata_store.pkl
+
+modules:
+  faithfulness:
+    nli_model: cross-encoder/nli-deberta-v3-base
+    entailment_threshold: 0.75
+    max_nli_tokens: 510
+    truncate_side: left
+    deberta_batch_size: 4
+  entity_verifier:
+    spacy_model: en_core_sci_lg
+    critical_entity_types: [DRUG, DOSAGE]
+    dosage_tolerance_pct: 10
+    rxnorm_api_url: https://rxnav.nlm.nih.gov/REST/rxcui.json
+    rxnorm_api_timeout_s: 3
+    rxnorm_cache_path: data/rxnorm_cache.csv
+  source_credibility:
+    method: keyword
+    tier_weights: [1.0, 0.85, 0.65, 0.40, 0.20]
+  contradiction:
+    nli_model: cross-encoder/nli-deberta-v3-base
+    confidence_threshold: 0.75
+    max_sentence_pairs: 45
+    deberta_batch_size: 4
+
+aggregator:
+  weights:
+    faithfulness: 0.40
+    entity_accuracy: 0.25
+    source_credibility: 0.20
+    contradiction_risk: 0.15
+  risk_bands:
+    low: [0, 30]
+    moderate: [31, 60]
+    high: [61, 85]
+    critical: [86, 100]
+
+llm:
+  model: mistral
+  base_url: http://localhost:11434
+  timeout_seconds: 20
+  judge_temperature: 0.0
+  generation_temperature: 0.7
+
+api:
+  host: 0.0.0.0
+  port: 8000
+  max_query_length: 500
+  max_answer_length: 2000
+  max_chunks: 10
+  max_chunk_length: 2000
+
+logging:
+  level: INFO
+  file: logs/medirag.log
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+================================================================================
+9. INSTALLATION & SETUP
+================================================================================
+
+9.1 requirements.txt
+---------------------
+langchain==0.1.20
+langchain-community==0.0.38
+faiss-cpu==1.7.4
+transformers==4.40.0
+sentence-transformers==2.7.0
+torch==2.2.0
+scispacy==0.5.4
+https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_lg-0.5.4.tar.gz
+ragas==0.1.9
+fastapi==0.110.0
+uvicorn==0.27.0
+streamlit==1.32.0
+pyyaml==6.0.1
+pydantic==2.6.0
+datasets==2.18.0
+pytest==8.1.0
+pandas==2.2.0
+numpy==1.26.0
+requests==2.31.0
+
+9.2 Ollama Setup — OS-SPECIFIC [fixes Gap #6]
+-----------------------------------------------
+
+LINUX / macOS:
+  curl -fsSL https://ollama.com/install.sh | sh
+  ollama pull mistral
+  ollama serve &
+
+WINDOWS (likely for most team members):
+  Option A — winget (recommended, built into Windows 11):
+    winget install Ollama.Ollama
+  Option B — direct installer:
+    Download OllamaSetup.exe from https://ollama.com/download/windows
+    Run installer → Ollama runs as a background system tray app
+    No need to run "ollama serve" on Windows — it auto-starts
+
+  After install (Windows, any option):
+    Open PowerShell or CMD:
+    ollama pull mistral
+    # Verify (Ollama auto-starts on Windows, no serve needed):
+    curl http://localhost:11434/api/tags
+
+  WINDOWS NOTE: On Windows, Ollama listens on localhost:11434 automatically
+  after install. The base_url in config.yaml (http://localhost:11434) works
+  the same across all platforms.
+
+GOOGLE COLAB:
+  # Ollama on Colab requires a workaround (no systemd):
+  !curl -fsSL https://ollama.com/install.sh | sh
+  import subprocess, time
+  subprocess.Popen(["ollama", "serve"])
+  time.sleep(5)    # wait for server to start
+  !ollama pull mistral
+
+9.3 First-Time Setup
+---------------------
+git clone <repo>
+cd medirag_eval
+python -m venv venv
+source venv/bin/activate          # Linux/macOS
+# OR: venv\Scripts\activate       # Windows CMD
+# OR: venv\Scripts\Activate.ps1   # Windows PowerShell
+
+pip install -r requirements.txt
+mkdir -p logs demo
+python scripts/build_rxnorm_cache.py   # run overnight — takes ~47 min
+python src/pipeline/ingest.py
+python src/pipeline/embedder.py
+python scripts/warmup.py               # verify all models load correctly
+streamlit run src/dashboard/app.py
+
+================================================================================
+10. EVALUATION & ACCEPTANCE CRITERIA
+================================================================================
+
+METRIC                              | MINIMUM  | STRETCH
+------------------------------------|----------|--------
+Faithfulness (Module 1)             | 0.70     | 0.85
+Entity Accuracy (Module 2)          | 0.65     | 0.80
+RAGAS Faithfulness                  | 0.70     | 0.85
+RAGAS Answer Relevancy              | 0.75     | 0.88
+RAGAS Context Precision             | 0.65     | 0.80
+RAGAS Context Recall (PubMedQA)     | 0.60     | 0.75
+HRS Pearson r vs manual labels      | r > 0.70 | r > 0.85
+API response time (CPU, post-warmup)| < 30s    | < 15s
+
+================================================================================
+11. DEVELOPMENT TIMELINE (v1.3)
+================================================================================
+
+WEEK 0 (PRE-DEMO SPRINT) | Mar 24 – Mar 27
+See Section 15 for team assignments.
+Goal: full demo stack working before March 28.
+
+Week 1-2  | Mar 29 – Apr 6
+  Goal    : RAG backbone stable for full corpus
+  Tasks   : Full dataset ingest, FAISS rebuild, retrieval validation
+  Owner   : Alapan + Bikram
+
+Week 3-4  | Apr 7 – Apr 20
+  Goal    : Module 1 hardened + RAGAS baseline documented
+  Tasks   : Truncation handling, batch tuning, baseline scores on 500 samples
+  Owner   : Alapan + Mohammed
+
+Week 5-6  | Apr 21 – May 4
+  Goal    : Module 2 + Module 3 + tests
+  Tasks   : Entity verifier with severity, RxNorm fallback,
+            keyword tier classifier, test_entity_verifier.py,
+            test_source_credibility.py
+  Owner   : Abhirup + Joydeep
+
+Week 7    | May 5 – May 11
+  Goal    : Module 4 + Aggregator + FastAPI
+  Tasks   : Contradiction detector, HRS formula, REST API, input validation
+  Owner   : Alapan + Bikram
+
+Week 8    | May 12 – May 18
+  Goal    : Dashboard + full test suite + ablations
+  Tasks   : Streamlit UI, all pytest green, weight sensitivity analysis,
+            switch Module 3 to metadata-based (FR-11b)
+  Owner   : Full team
+
+Week 9-10 | May 19 – May 31
+  Goal    : Report + submission
+  Owner   : Alapan (write), all review
+
+================================================================================
+12. CONSTRAINTS & ASSUMPTIONS
+================================================================================
+
+12.1 HARD CONSTRAINTS
+- Zero cost: no paid APIs.
+- GPU optional: all modules work on CPU.
+- No production deployment.
+- No real patient data.
+- No internet required at runtime (after setup).
+
+12.2 ASSUMPTIONS
+- BioBERT retrieval works without fine-tuning.
+- Mistral-7B follows FR-05 prompt reliably.
+- DeBERTa-v3-base generalizes to biomedical NLI without fine-tuning.
+- DrugBank Open Data has no dose ranges (severity logic adjusted in FR-09).
+- Keyword-based tier classifier sufficient for demo.
+- rxnorm_cache.csv built before demo (FR-20 run overnight).
+
+12.3 OUT OF SCOPE (v1.0)
+- Production deployment on eSanjeevani / ABDM
+- Multilingual support
+- Model fine-tuning
+- User authentication
+- Multimodal inputs
+
+================================================================================
+13. LOGGING STRATEGY
+================================================================================
+
+Setup in src/__init__.py:
+  import logging, os
+  os.makedirs("logs", exist_ok=True)
+  logging.basicConfig(
+      level=logging.INFO,
+      format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+      handlers=[
+          logging.FileHandler("logs/medirag.log"),
+          logging.StreamHandler()
+      ]
+  )
+
+Per-module: logger = logging.getLogger(__name__)
+
+Levels:
+  DEBUG   — truncation events, NLI scores, cache hits/misses
+  INFO    — module start/end, final scores, RAGAS call start/end, warmup steps
+  WARNING — JSON parse failure, score OOB, empty answer, RxNorm timeout,
+            cache miss, context_recall skipped (no ground_truth)
+  ERROR   — module exception, Ollama connection refused
+
+Demo day: set logging.level = WARNING in config.yaml.
+
+================================================================================
+14. REVISION HISTORY
+================================================================================
+
+Version | Date     | Author     | Changes
+--------|----------|------------|------------------------------------------
+1.0     | Mar 2026 | Alapan Sen | Initial release
+1.1     | Mar 2026 | Alapan Sen | 12 gaps patched
+1.2     | Mar 2026 | Alapan Sen | 9 gaps patched
+1.3     | Mar 2026 | Alapan Sen | 6 gaps patched — implementation-complete
+1.4     | Mar 2026 | Alapan Sen | 6 gaps patched — see CHANGELOG v1.4 above
+
+================================================================================
+15. DEMO DAY RUN PLAN — MARCH 28 (v1.3)
+================================================================================
+
+--- .gitignore CORRECT PATTERN [fixes Gap #4] ---
+
+The v1.2 pattern was WRONG. Git cannot un-ignore files inside an ignored
+directory. The correct approach: do NOT ignore data/index/ at all.
+Ignore only the large raw/processed subdirectories.
+
+Correct .gitignore:
+  # Ignore large raw data and processed chunks
+  data/raw/
+  data/processed/
+
+  # data/index/ is NOT listed here — it will be tracked by git normally
+  # (or via Git LFS if large, see below)
+
+  # Python
+  __pycache__/
+  *.pyc
+  venv/
+  .env
+  logs/
+
+This means data/index/faiss.index and data/index/metadata_store.pkl are
+tracked by git. For the demo subset (~30-50MB), this is fine via Git LFS.
+
+--- FAISS INDEX DISTRIBUTION ---
+
+Check size: ls -lh data/index/
+
+IF total < 100MB → use Git LFS:
+  git lfs install
+  git lfs track "data/index/faiss.index"
+  git lfs track "data/index/metadata_store.pkl"
+  git add .gitattributes data/index/
+  git commit -m "Add demo FAISS index via LFS"
+  git push
+  # On demo machine: git clone → LFS files auto-download
+
+IF total >= 100MB → use Google Drive + gdown:
+  zip -r index.zip data/index/
+  # Upload to Drive, get file_id from shareable link
+  # Add to README: gdown https://drive.google.com/uc?id=<file_id>
+  # On demo machine:
+  pip install gdown
+  gdown https://drive.google.com/uc?id=<file_id>
+  unzip index.zip -d data/
+
+--- WEEK 0 TASK ASSIGNMENT (Mar 24-27) [fixes Gap #2] ---
+
+4 days, 5 people. Tasks split to run in parallel.
+
+DAY 1 — Monday March 24
+  Alapan (lead)  : FAISS index build on 500 PubMedQA + 200 MedQA
+                   Verify retriever returns (text, metadata, score) tuples
+  Mohammed       : RAGAS + Ollama integration (FR-15) — get one evaluation call
+                   working end-to-end, print raw RAGAS scores to console
+  Abhirup        : Run build_rxnorm_cache.py overnight on personal machine
+                   (starts tonight, completes tomorrow morning)
+  Bikram         : Streamlit app scaffold — HRS gauge + score bars with
+                   hardcoded dummy data (layout only, no real pipeline yet)
+  Joydeep        : Module 1 faithfulness scorer — DeBERTa NLI on 3 test
+                   cases, print ENTAILED/NEUTRAL/CONTRADICTED per claim
+
+DAY 2 — Tuesday March 25
+  Alapan         : Wire pipeline: retriever output → Module 1 → RAGAS
+                   Single end-to-end evaluation call producing JSON output
+  Mohammed       : Debug RAGAS BioBERT embedding integration, verify
+                   answer_relevancy score is non-zero and meaningful
+  Abhirup        : Verify rxnorm_cache.csv built correctly, commit to repo
+  Bikram         : Connect Streamlit to real pipeline output, wire HRS gauge
+                   to live JSON from evaluation call
+  Joydeep        : Module 1 full integration test — 10 real PubMedQA samples,
+                   record faithfulness scores, verify < 0.5 on known hallucinations
+
+DAY 3 — Wednesday March 26
+  Alapan         : Full dry-run demo start-to-finish with all 3 sample queries
+                   Fix any crashes. Save demo_fallback.json.
+  Mohammed       : Dashboard polish — clause annotation color coding,
+                   RAGAS scores panel, raw JSON expander
+  Abhirup        : Add keyword-based source credibility to pipeline output
+                   (even if only for display in dashboard)
+  Bikram         : FAISS index → Git LFS or Google Drive (whichever applies)
+                   Verify clean clone + index download on separate machine
+  Joydeep        : Write test_faithfulness.py (minimum 4 tests), run pytest
+
+DAY 4 — Thursday March 27
+  ALL TEAM        : Full demo dry-run on demo machine (not dev machine)
+                   Time it — must complete in < 5 minutes
+                   Fix any machine-specific issues (path separators, etc.)
+  Alapan          : Set logging.level = WARNING, final config.yaml review
+  Bikram          : Verify Ollama running, mistral pulled, curl health check
+  All             : Travel prep for Bharat Mandapam
+
+--- DEMO FLOW (5 minutes) ---
+
+Pre-loaded: Streamlit already open in browser, Ollama running, warmup done.
+  0:00 — Paste Query 1, press Enter
+  0:30 — Point to HRS gauge updating (explain risk band)
+  1:30 — Point to CONTRADICTED clause annotation (explain NLI)
+  2:30 — Show RAGAS scores panel (explain faithfulness vs answer relevancy)
+  3:30 — Expand raw JSON (show clause_annotations structure)
+  4:00 — Architecture slide: 4 modules, HRS formula
+  4:30 — Impact slide: eSanjeevani, ABDM, citizen services angle
+
+--- SAMPLE QUERIES (pre-test all 3 in dry-run) ---
+  Q1: "What is the recommended dosage of Metformin for Type 2 Diabetes
+       in elderly patients with kidney disease?"
+  Q2: "What are the contraindications of ibuprofen for patients with
+       chronic kidney disease?"
+  Q3: "What is the first-line treatment for hypertension according to
+       clinical guidelines?"
+
+--- FALLBACK ---
+  If Ollama fails: st.json(json.load(open("demo/demo_fallback.json")))
+  Say: "Let me show you pre-computed results while the service restarts."
+
+================================================================================
+16. MODEL WARMUP STRATEGY [NEW — fixes Gap #3]
+================================================================================
+
+PURPOSE:
+  On first inference call, each model has a cold-start delay:
+    Mistral-7B (Ollama) : 10-30 seconds to load into VRAM/RAM
+    BioBERT embeddings  : 5-10 seconds to load into memory
+    DeBERTa-v3          : 5-10 seconds to load into memory
+    SciSpaCy en_sci_lg  : 3-5 seconds
+
+  During a live 5-minute demo, a 30-second cold-start on the first query is
+  unacceptable. Run warmup.py BEFORE opening Streamlit on stage.
+
+scripts/warmup.py FULL SPEC:
+
+  import requests, time, logging
+  from transformers import pipeline as hf_pipeline, AutoTokenizer
+  from langchain_community.embeddings import HuggingFaceEmbeddings
+  from langchain_community.chat_models import ChatOllama
+  import spacy, yaml
+
+  logging.basicConfig(level=logging.INFO,
+                      format="%(asctime)s [%(levelname)s] %(message)s")
+  logger = logging.getLogger("warmup")
+
+  config = yaml.safe_load(open("config.yaml"))
+
+  def warmup_ollama():
+      logger.info("Warming up Ollama / Mistral...")
+      llm = ChatOllama(
+          model=config["llm"]["model"],
+          base_url=config["llm"]["base_url"],
+          temperature=0.0
+      )
+      response = llm.invoke("Respond with the single word: READY")
+      logger.info(f"Ollama warm — response: {response.content.strip()}")
+
+  def warmup_biobert():
+      logger.info("Warming up BioBERT embeddings...")
+      emb = HuggingFaceEmbeddings(
+          model_name=config["retrieval"]["embedding_model"],
+          model_kwargs={"device": "cpu"},
+          encode_kwargs={"normalize_embeddings": True}
+      )
+      _ = emb.embed_query("warmup query")
+      logger.info("BioBERT warm.")
+
+  def warmup_deberta():
+      """IMPORTANT: This creates a THROW-AWAY DeBERTa instance for verification.
+      It proves the model downloads and loads correctly. This instance is NOT
+      reused — it is garbage-collected after this function returns.
+      The main pipeline (src/evaluate.py) creates its own SHARED singleton
+      that is passed to both FaithfulnessScorer and ContradictionDetector.
+      Two separate loads are intentional: warmup verifies, main provides shared."""
+      logger.info("Warming up DeBERTa NLI (verification load)...")
+      pipe = hf_pipeline(
+          "text-classification",
+          model=config["modules"]["faithfulness"]["nli_model"],
+          device=-1,
+          batch_size=1
+      )
+      _ = pipe("Test claim. [SEP] Test context.")
+      logger.info("DeBERTa warm (verification instance discarded).")
+
+  def warmup_scispacy():
+      logger.info("Warming up SciSpaCy...")
+      nlp = spacy.load(config["modules"]["entity_verifier"]["spacy_model"])
+      _ = nlp("Metformin 500mg for Type 2 Diabetes.")
+      logger.info("SciSpaCy warm.")
+
+  def warmup_faiss():
+      logger.info("Verifying FAISS index...")
+      import faiss, pickle
+      idx  = faiss.read_index(config["retrieval"]["index_path"])
+      meta = pickle.load(open(config["retrieval"]["metadata_path"], "rb"))
+      logger.info(f"FAISS index has {idx.ntotal} vectors, "
+                  f"{len(meta)} metadata entries.")
+
+  def warmup_save_fallback():
+      """Run a real evaluation on Q1 and save to demo/demo_fallback.json.
+      Only saves if the file does not already exist (idempotent)."""
+      import os, json, sys
+      os.makedirs("demo", exist_ok=True)
+      fallback_path = "demo/demo_fallback.json"
+      if os.path.exists(fallback_path):
+          logger.info(f"Fallback JSON already exists at {fallback_path} — skipping.")
+          return
+      logger.info("Generating demo_fallback.json (may take ~30s)...")
+      try:
+          sys.path.insert(0, "src")
+          from evaluate import run_evaluation  # src/evaluate.py
+          query = ("What is the recommended dosage of Metformin for "
+                   "Type 2 Diabetes in elderly patients with kidney disease?")
+          result = run_evaluation(query)  # returns dict matching FR-17
+          with open(fallback_path, "w", encoding="utf-8") as f:
+              json.dump(result, f, indent=2, ensure_ascii=False)
+          logger.info(f"Fallback JSON saved to {fallback_path}")
+      except Exception as e:
+          logger.error(f"Could not generate fallback JSON: {e}")
+          logger.warning("Create demo/demo_fallback.json manually before demo day.")
+
+  if __name__ == "__main__":
+      start = time.time()
+      warmup_faiss()
+      warmup_biobert()
+      warmup_deberta()
+      warmup_scispacy()
+      warmup_ollama()
+      warmup_save_fallback()   # NEW v1.4 — auto-generates demo/demo_fallback.json
+      elapsed = time.time() - start
+      logger.info(f"All models warm. Total warmup time: {elapsed:.1f}s")
+      logger.info("Safe to launch Streamlit dashboard.")
+
+USAGE:
+  python scripts/warmup.py
+  # Wait for "All models warm" message
+  # THEN launch: streamlit run src/dashboard/app.py
+
+Expected output (target < 60s total):
+  FAISS verified     : ~1s
+  BioBERT warm       : ~8s
+  DeBERTa warm       : ~8s
+  SciSpaCy warm      : ~4s
+  Ollama warm        : ~25s (first call — model loads into memory)
+  Total              : ~46s
+
+DEMO DAY ORDER:
+  1. ollama serve (Windows: already running as tray app)
+  2. python scripts/warmup.py  ← wait for "Safe to launch"
+  3. streamlit run src/dashboard/app.py
+  4. Open browser to http://localhost:8501
+  5. Keep both terminals open throughout demo
+
+================================================================================
+17. CONFIGURATION FILES — pytest.ini AND .gitattributes [NEW v1.4]
+================================================================================
+
+pytest.ini (place in project root):
+  [pytest]
+  testpaths = tests
+  python_files = test_*.py
+  python_classes = Test*
+  python_functions = test_*
+  addopts = -v --tb=short
+
+  PURPOSE: Without pytest.ini, running `pytest` from the project root may
+  fail to resolve imports (e.g. `from src.modules.faithfulness import ...`)
+  because Python path is not set. The ini ensures tests/ is discovered and
+  src/ modules are importable.
+
+  ADDITIONAL STEP: Add a conftest.py at project root:
+    # conftest.py
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+  This ensures `import src.modules.faithfulness` works in all test files.
+
+.gitattributes (place in project root):
+  # Normalize all text files to LF on commit (prevents CRLF corruption)
+  * text=auto
+
+  # Explicit LF for all source and config files
+  *.py   text eol=lf
+  *.txt  text eol=lf
+  *.md   text eol=lf
+  *.yaml text eol=lf
+  *.json text eol=lf
+  *.ini  text eol=lf
+
+  # CSV must be LF — Windows checkout would corrupt rxnorm_cache.csv with CRLF
+  # causing pandas read_csv to include \r in drug names, breaking exact matching.
+  *.csv  text eol=lf
+
+  # Binary files — tell git not to attempt text diff or line-ending conversion
+  data/index/faiss.index      binary
+  data/index/metadata_store.pkl binary
+  demo/demo_fallback.json     text eol=lf
+
+================================================================================
+END OF DOCUMENT
+MediRAG-Eval SRS v1.4 | Amity University Kolkata | 2026
+33 total gaps resolved across all versions (v1.0 through v1.4).
+================================================================================

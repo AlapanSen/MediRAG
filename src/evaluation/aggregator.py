@@ -95,11 +95,24 @@ def aggregate(
 
     composite = sum(contributions.values())
 
-    # Confidence level
+    # HRS = round(100 × (1 - composite)), then map to risk band
+    hrs = int(round(100 * (1.0 - composite)))
+    hrs = max(0, min(100, hrs))
+
+    if hrs <= 30:
+        risk_band = "LOW"
+    elif hrs <= 60:
+        risk_band = "MODERATE"
+    elif hrs <= 85:
+        risk_band = "HIGH"
+    else:
+        risk_band = "CRITICAL"
+
+    # Confidence level (based on composite, not HRS)
     if composite >= 0.80:
         confidence = "HIGH"
     elif composite >= 0.55:
-        confidence = "MEDIUM"
+        confidence = "MODERATE"
     else:
         confidence = "LOW"
 
@@ -113,6 +126,8 @@ def aggregate(
             "ragas_composite":    round(ragas_score, 4),
         },
         "weighted_composite": round(composite, 4),
+        "hrs": hrs,
+        "risk_band": risk_band,
         "component_contributions": contributions,
         "confidence_level": confidence,
         "module_latencies_ms": {

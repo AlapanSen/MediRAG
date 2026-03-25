@@ -41,11 +41,11 @@ logger = logging.getLogger(__name__)
 
 MODEL_NAME = "cross-encoder/nli-deberta-v3-small"
 
-# NLI label order returned by the model
-# cross-encoder/nli-deberta-v3-small returns [contradiction, entailment, neutral]
+# NLI label order returned by cross-encoder/nli-deberta-v3-small:
+# index 0 = contradiction, index 1 = neutral, index 2 = entailment
 LABEL_CONTRADICTION = 0
-LABEL_ENTAILMENT = 1
-LABEL_NEUTRAL = 2
+LABEL_NEUTRAL = 1
+LABEL_ENTAILMENT = 2
 
 ENTAILMENT_THRESHOLD = 0.50
 CONTRADICTION_THRESHOLD = 0.30

@@ -50,8 +50,11 @@ TIER_WEIGHTS: dict[str, float] = {
 _KEYWORD_MAP: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(guideline|clinical practice|recommendation|consensus)\b", re.I), "clinical_guideline"),
     (re.compile(r"\b(systematic review|meta.?analysis)\b", re.I),                    "systematic_review"),
+    # RCT / controlled trial → highest single-study evidence tier
+    (re.compile(r"\b(randomized|randomised|controlled trial|rct|clinical trial)\b", re.I), "clinical_guideline"),
     (re.compile(r"\b(review|overview)\b", re.I),                                     "review_article"),
     (re.compile(r"\b(case report|case study|clinical case)\b", re.I),                "clinical_case"),
+    (re.compile(r"\b(abstract|research article|original article|journal)\b", re.I),  "research_abstract"),
 ]
 
 
@@ -59,7 +62,9 @@ def _classify_tier(chunk: dict) -> tuple[str, str | None]:
     """
     Return (tier_type, matched_keyword) for a single retrieved chunk dict.
 
-    Checks metadata fields first, then runs keyword regex on pub_type + title.
+    Priority 1: explicit tier_type field (set by embedder.py)
+    Priority 2: pub_type field directly maps to a known tier name
+    Priority 3: keyword regex on pub_type + title text
     """
     # Priority 1: explicit tier_type already set (e.g., by embedder.py)
     tier = (
@@ -69,15 +74,42 @@ def _classify_tier(chunk: dict) -> tuple[str, str | None]:
     if tier and tier in TIER_WEIGHTS:
         return tier, None
 
-    # Priority 2: keyword matching on pub_type + title text
-    pub_type = str(chunk.get("pub_type") or chunk.get("metadata", {}).get("pub_type") or "")
+    # Priority 2: direct pub_type value lookup
+    # Handles underscore-separated values like "research_abstract" which
+    # won't match word-boundary regex patterns
+    pub_type_raw = str(
+        chunk.get("pub_type") or chunk.get("metadata", {}).get("pub_type") or ""
+    ).strip().lower()
+
+    _PUB_TYPE_DIRECT: dict[str, str] = {
+        "research_abstract":  "research_abstract",
+        "abstract":           "research_abstract",
+        "systematic_review":  "systematic_review",
+        "systematic review":  "systematic_review",
+        "meta_analysis":      "systematic_review",
+        "meta-analysis":      "systematic_review",
+        "clinical_guideline": "clinical_guideline",
+        "clinical guideline": "clinical_guideline",
+        "guideline":          "clinical_guideline",
+        "review_article":     "review_article",
+        "review article":     "review_article",
+        "review":             "review_article",
+        "clinical_case":      "clinical_case",
+        "case_report":        "clinical_case",
+        "case report":        "clinical_case",
+    }
+    if pub_type_raw in _PUB_TYPE_DIRECT:
+        return _PUB_TYPE_DIRECT[pub_type_raw], None
+
+    # Priority 3: keyword regex on pub_type + title text
     title = str(chunk.get("title") or chunk.get("metadata", {}).get("title") or "")
-    text_to_search = f"{pub_type} {title}"
+    text_to_search = f"{pub_type_raw} {title}"
 
     for pattern, matched_tier in _KEYWORD_MAP:
         m = pattern.search(text_to_search)
         if m:
             return matched_tier, m.group(0)
+
 
     return "unknown", None
 
@@ -131,7 +163,7 @@ def score_source_credibility(
             "research_abstract":  3,
             "review_article":     4,
             "clinical_case":      5,
-        }.get(tier_type, 5)
+        }.get(tier_type, 6)  # 6 = unknown/unclassified
 
         chunk_details.append(
             {

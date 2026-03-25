@@ -18,7 +18,7 @@ sentence-transformers>=2.7.0
 ragas==0.1.9
 fastapi==0.110.0
 uvicorn==0.27.0
-streamlit==1.32.0
+streamlit>=1.35.0                  # 1.35+ supports protobuf 5 (needed by google-generativeai)
 pyyaml==6.0.1
 pydantic>=2.9.0        # 2.6.0 has broken pydantic.v1 on Python 3.12 (ForwardRef bug); fixed in 2.9+
 datasets==2.18.0
@@ -26,3 +26,5 @@ pytest==8.1.0
 pandas>=2.2.0          # 2.2.0 has Python 3.12 wheels (no longer need 2.2.3+)
 numpy>=1.26.4,<2       # langchain==0.1.20 requires numpy<2; 1.26.4 has Python 3.12 wheels
 requests==2.31.0
+google-genai>=1.0.0                # New Google GenAI SDK (replaces deprecated google-generativeai)
+pysbd>=0.3.4                       # sentence boundary detection (faithfulness module)

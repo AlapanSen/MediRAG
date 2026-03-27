@@ -12,6 +12,13 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
+class IngestRequest(BaseModel):
+    """POST /ingest — append a custom document to the FAISS index."""
+    title: str = Field(..., description="Document title")
+    text: str = Field(..., min_length=10, description="Raw text of the document to ingest")
+    pub_type: str = Field(default="clinical_guideline", description="Document type")
+    source: str = Field(default="custom_upload", description="Source of the document")
+
 
 # ---------------------------------------------------------------------------
 # Request schemas
@@ -161,6 +168,12 @@ class QueryRequest(BaseModel):
         default=None,
         description="Ollama base URL override (e.g. 'http://localhost:8080')"
     )
+    # Demo/test only — injects a false claim into the LLM answer before evaluation
+    # to demonstrate the intervention system catching hallucinations.
+    inject_hallucination: Optional[str] = Field(
+        default=None,
+        description="[DEMO ONLY] Appends a false medical claim to the answer before evaluation."
+    )
 
 
 class RetrievedChunk(BaseModel):
@@ -186,4 +199,21 @@ class QueryResponse(BaseModel):
     risk_band: str
     module_results: ModuleResults
     total_pipeline_ms: int
+    # Intervention fields (active safety gate)
+    intervention_applied: bool = Field(
+        default=False,
+        description="True if the system modified or blocked the response for safety.",
+    )
+    intervention_reason: Optional[str] = Field(
+        default=None,
+        description="CRITICAL_BLOCKED | HIGH_RISK_REGENERATED | null",
+    )
+    original_answer: Optional[str] = Field(
+        default=None,
+        description="The original (unsafe) LLM answer before intervention, for transparency.",
+    )
+    intervention_details: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Which modules triggered the intervention and their scores.",
+    )
 

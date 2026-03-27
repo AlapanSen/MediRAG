@@ -81,64 +81,171 @@ with st.sidebar:
 # Main Layout
 # ---------------------------------------------------------------------------
 st.title("🏥 MediRAG Eval Dashboard")
-st.markdown("End-to-End Pipeline: Retrieval → LLM Generation → Verification")
 
-# --- Input Area ---
-question_input = st.text_area(
-    "Medical Question",
-    height=100,
-    placeholder="e.g., What is the recommended dosage of Metformin for elderly Type 2 Diabetes patients?",
-)
+main_tab1, main_tab2 = st.tabs(["🧠 Query Engine", "📚 Knowledge Manager"])
 
-if st.button("🚀 Run Pipeline", type="primary"):
-    if not question_input.strip():
-        st.warning("Please enter a medical question.")
-    elif provider_choice == "Gemini" and not llm_api_key:
-        st.warning("Please enter your Gemini API Key in the sidebar.")
-    else:
-        payload = {
-            "question": question_input.strip(),
-            "top_k": top_k,
-            "run_ragas": run_ragas,
-            "llm_provider": provider_choice.lower(),
-        }
-        if llm_api_key:
-            payload["llm_api_key"] = llm_api_key
-        if llm_model:
-            payload["llm_model"] = llm_model
-        if ollama_url:
-            payload["ollama_url"] = ollama_url
+# ===========================================================================
+# TAB 1: QUERY ENGINE
+# ===========================================================================
+with main_tab1:
+    st.markdown("End-to-End Pipeline: Retrieval → LLM Generation → Verification")
 
-        with st.spinner(f"Retrieving → Generating ({provider_choice}) → Evaluating..."):
-            t0 = time.time()
-            try:
-                resp = requests.post(f"{api_url}/query", json=payload, timeout=125)
-                resp.raise_for_status()
-                st.session_state.eval_result = resp.json()
-            except requests.exceptions.RequestException as e:
-                err_text = str(e)
-                if getattr(e, "response", None) is not None:
-                    try:
-                        err_text = e.response.json().get("detail", err_text)
-                    except ValueError:
-                        err_text = e.response.text
-                st.error(f"API Error: {err_text}")
-                st.session_state.eval_result = None
-            
-            st.session_state.eval_latency = round(time.time() - t0, 1)
+    # --- Input Area ---
+    question_input = st.text_area(
+        "Medical Question",
+        height=100,
+        placeholder="e.g., What is the recommended dosage of Metformin for elderly Type 2 Diabetes patients?",
+    )
+
+    # Demo mode: inject a false claim to trigger the intervention system
+    with st.expander("🧪 Demo Mode — Force Hallucination Detection"):
+        st.caption("Injects a clinically wrong claim AFTER the LLM answer before evaluation. Shows the intervention system catching and correcting it.")
+        demo_enabled = st.checkbox("Enable hallucination injection")
+        demo_claim = st.selectbox(
+            "Select false claim to inject:",
+            options=[
+                "Dopamine is the recommended first-line vasopressor for septic shock and should always be used before norepinephrine.",
+                "Norepinephrine is absolutely contraindicated in septic shock and must never be administered to ICU patients.",
+                "Micafungin should never be used as first-line antifungal — fluconazole at 100mg is the only recommended agent.",
+                "Corticosteroids are mandatory for ALL septic shock patients regardless of vasopressor requirement.",
+            ],
+            disabled=not demo_enabled,
+        )
+
+    if st.button("🚀 Run Pipeline", type="primary"):
+        if not question_input.strip():
+            st.warning("Please enter a medical question.")
+        elif provider_choice == "Gemini" and not llm_api_key:
+            st.warning("Please enter your Gemini API Key in the sidebar.")
+        else:
+            payload = {
+                "question": question_input.strip(),
+                "top_k": top_k,
+                "run_ragas": run_ragas,
+                "llm_provider": provider_choice.lower(),
+            }
+            if llm_api_key:
+                payload["llm_api_key"] = llm_api_key
+            if llm_model:
+                payload["llm_model"] = llm_model
+            if ollama_url:
+                payload["ollama_url"] = ollama_url
+            if demo_enabled and demo_claim:
+                payload["inject_hallucination"] = demo_claim
+
+            with st.spinner(f"Retrieving → Generating ({provider_choice}) → Evaluating..."):
+                t0 = time.time()
+                try:
+                    resp = requests.post(f"{api_url}/query", json=payload, timeout=125)
+                    resp.raise_for_status()
+                    st.session_state.eval_result = resp.json()
+                except requests.exceptions.RequestException as e:
+                    err_text = str(e)
+                    if getattr(e, "response", None) is not None:
+                        try:
+                            err_text = e.response.json().get("detail", err_text)
+                        except ValueError:
+                            err_text = e.response.text
+                    st.error(f"API Error: {err_text}")
+                    st.session_state.eval_result = None
+                
+                st.session_state.eval_latency = round(time.time() - t0, 1)
+
+# ===========================================================================
+# TAB 2: KNOWLEDGE MANAGER
+# ===========================================================================
+with main_tab2:
+    st.header("Upload Clinical Documents")
+    st.markdown("Inject new clinical guidelines (`.pdf` or `.txt`) directly into the active FAISS memory in real-time. The AI will immediately begin grounding its answers using this new knowledge.")
+    
+    upload_title = st.text_input("Document Name (e.g. 2026 ICU Pathways)", value="")
+    uploaded_file = st.file_uploader("Upload File", type=["pdf", "txt"], accept_multiple_files=False)
+    
+    if st.button("Inject into Database", type="primary"):
+        if not uploaded_file:
+            st.warning("Please upload a PDF or TXT file.")
+        elif not upload_title.strip():
+            st.warning("Please provide a Document Name.")
+        else:
+            with st.spinner("Extracting text and generating vectors..."):
+                extracted_text = ""
+                try:
+                    if uploaded_file.name.lower().endswith(".pdf"):
+                        import pypdf
+                        reader = pypdf.PdfReader(uploaded_file)
+                        extracted_text = "\\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+                    else:
+                        extracted_text = uploaded_file.getvalue().decode("utf-8")
+                        
+                    if len(extracted_text) < 20:
+                        st.error("Document is empty or text could not be extracted.")
+                    else:
+                        # Send to backend
+                        resp = requests.post(
+                            f"{api_url}/ingest",
+                            json={
+                                "title": upload_title.strip(),
+                                "text": extracted_text,
+                                "pub_type": "clinical_guideline",
+                                "source": uploaded_file.name
+                            },
+                            timeout=60
+                        )
+                        resp.raise_for_status()
+                        res_data = resp.json()
+                        st.success(f"Successfully injected {res_data['chunks_added']} vectors for '{res_data['title']}'!")
+                        st.balloons()
+                except ImportError:
+                    st.error("PyPDF is not installed. Run `pip install pypdf`.")
+                except requests.exceptions.RequestException as e:
+                    st.error(f"Failed to ingest: {e}")
+                except Exception as e:
+                    st.error(f"Extraction error: {e}")
 
 # ---------------------------------------------------------------------------
-# Results Display
+# Results Display (Only shows for queries)
 # ---------------------------------------------------------------------------
 res = st.session_state.eval_result
 if res:
     st.divider()
 
+    # =========================================================================
+    # INTERVENTION BANNERS (shown before anything else if active)
+    # =========================================================================
+    if res.get("intervention_applied"):
+        reason = res.get("intervention_reason", "")
+        iv_details = res.get("intervention_details") or {}
+        original = res.get("original_answer", "")
+
+        if reason == "CRITICAL_BLOCKED":
+            st.error(
+                f"⛔ **SAFETY GATE TRIGGERED — Response Blocked**\n\n"
+                f"This response was automatically **blocked** by MediRAG because it scored "
+                f"**HRS {iv_details.get('hrs_original', '?')}/100 (CRITICAL)**. "
+                f"The answer showed signs of hallucination or direct contradiction with clinical evidence."
+            )
+            if original:
+                with st.expander("🔍 View original blocked response (for transparency)"):
+                    st.warning(original)
+
+        elif reason == "HIGH_RISK_REGENERATED":
+            hrs_before = iv_details.get("hrs_original", "?")
+            hrs_after = iv_details.get("hrs_corrected", "?")
+            st.warning(
+                f"⚠️ **INTERVENTION APPLIED — Response Regenerated**\n\n"
+                f"The initial response scored **HRS {hrs_before}/100 (HIGH risk)**. "
+                f"MediRAG automatically regenerated a safer, context-only answer. "
+                f"New HRS: **{hrs_after}/100**. The original response is shown below."
+            )
+            if original:
+                with st.expander("🔍 View original (flagged) response"):
+                    st.markdown(original)
+
     # --- Header Metrics ---
     cols = st.columns(4)
     hrs = res.get("hrs", 0)
     rb = res.get("risk_band", "UNKNOWN")
-    
+
     # Color logic for HRS
     hrs_color = "#28a745" if hrs < 40 else "#ffc107" if hrs < 70 else "#fd7e14" if hrs < 85 else "#dc3545"
 

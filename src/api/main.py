@@ -28,6 +28,7 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+import threading
 from src.api.schemas import (
     ContextChunk,
     EvaluateRequest,
@@ -38,6 +39,7 @@ from src.api.schemas import (
     QueryRequest,
     QueryResponse,
     RetrievedChunk,
+    IngestRequest,
 )
 from src.evaluate import run_evaluation
 from src.pipeline.generator import generate_answer
@@ -328,6 +330,12 @@ def query(req: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=503,
             detail=f"LLM generation failed: {exc}") from exc
 
+    # [DEMO MODE] Inject a false claim to demonstrate the intervention system
+    if req.inject_hallucination:
+        logger.warning("DEMO MODE: Injecting hallucinated claim into answer: '%s'",
+                       req.inject_hallucination)
+        answer = answer + " " + req.inject_hallucination.strip()
+
     # Step 3: Evaluate
     try:
         eval_result = run_evaluation(
@@ -341,16 +349,85 @@ def query(req: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=500,
             detail=f"Evaluation error: {exc}") from exc
 
-    # Step 4: Build response
+    # =========================================================================
+    # Step 3b: INTERVENTION LOOP — MediRAG acts on evaluation results
+    # =========================================================================
+    from src.pipeline.generator import generate_strict_answer
+
     details = eval_result.details or {}
     composite = float(eval_result.score)
     hrs = int(round(100 * (1.0 - composite)))
     hrs = max(0, min(100, hrs))
     mod_results: dict = details.get("module_results", {})
 
+    intervention_applied = False
+    intervention_reason = None
+    original_answer = None
+    intervention_details = None
+
+    faith_score = (mod_results.get("faithfulness") or {}).get("score", 1.0)
+
+    # Tier 1: CRITICAL BLOCK (HRS ≥ 86) — response is too dangerous to show
+    if hrs >= 86:
+        original_answer = answer
+        answer = (
+            "⛔ UNSAFE RESPONSE BLOCKED by MediRAG Safety Gate.\n\n"
+            "The generated answer was flagged as CRITICAL risk "
+            f"(Health Risk Score: {hrs}/100). "
+            "It showed signs of hallucination or contradiction with the retrieved evidence. "
+            "Please consult a qualified medical professional or rephrase your question."
+        )
+        intervention_applied = True
+        intervention_reason = "CRITICAL_BLOCKED"
+        intervention_details = {
+            "hrs_original": hrs,
+            "faithfulness": faith_score,
+            "message": "Response blocked: HRS ≥ 86 (CRITICAL risk band).",
+        }
+        logger.warning("INTERVENTION: CRITICAL_BLOCKED — HRS=%d", hrs)
+
+    # Tier 2: HIGH RISK REGENERATION (HRS ≥ 40 or faithfulness < 1.0)
+    elif hrs >= 40 or faith_score < 1.0:
+        original_answer = answer
+        original_hrs = hrs
+        logger.warning(
+            "INTERVENTION: HIGH_RISK_REGENERATED — HRS=%d, faith=%.2f. Regenerating with strict prompt.",
+            hrs, faith_score
+        )
+        try:
+            answer = generate_strict_answer(req.question, context_chunks, _cfg, overrides=llm_overrides)
+            # Re-evaluate the corrected answer
+            eval_result = run_evaluation(
+                question=req.question,
+                answer=answer,
+                context_chunks=context_chunks,
+                run_ragas=False,  # skip RAGAS on retry to reduce latency
+            )
+            details = eval_result.details or {}
+            composite = float(eval_result.score)
+            hrs = int(round(100 * (1.0 - composite)))
+            hrs = max(0, min(100, hrs))
+            mod_results = details.get("module_results", {})
+        except Exception as exc:
+            logger.error("Strict regeneration failed: %s — keeping original answer", exc)
+            answer = original_answer  # fall back gracefully
+            original_answer = None
+
+        intervention_applied = True
+        intervention_reason = "HIGH_RISK_REGENERATED"
+        intervention_details = {
+            "hrs_original": original_hrs,
+            "hrs_corrected": hrs,
+            "faithfulness_original": faith_score,
+            "faithfulness_corrected": (mod_results.get("faithfulness") or {}).get("score", 0),
+            "message": "Response regenerated with strict context-only prompt due to high risk score.",
+        }
+    # =========================================================================
+
+    # Step 4: Build response
     total_ms = int((_time.perf_counter() - t_total) * 1000)
-    logger.info("POST /query → HRS=%d (%s) in %d ms total",
-                hrs, details.get("risk_band", "?"), total_ms)
+    logger.info("POST /query → HRS=%d (%s) intervention=%s in %d ms total",
+                hrs, details.get("risk_band", "?"), intervention_reason or "none", total_ms)
 
     return QueryResponse(
         question=req.question,
@@ -368,4 +445,89 @@ def query(req: QueryRequest) -> QueryResponse:
             ragas=_module_score(mod_results, "ragas"),
         ),
         total_pipeline_ms=total_ms,
+        intervention_applied=intervention_applied,
+        intervention_reason=intervention_reason,
+        original_answer=original_answer,
+        intervention_details=intervention_details,
     )
+
+# ---------------------------------------------------------------------------
+# POST /ingest — dynamically append new documents to the FAISS index
+# ---------------------------------------------------------------------------
+_faiss_lock = threading.Lock()
+
+@app.post("/ingest", tags=["ingestion"])
+def ingest_document(req: IngestRequest):
+    """
+    Dynamically ingest a new document into the running FAISS index.
+    Thread-safe implementation uses a lock to prevent concurrent write corruption.
+    """
+    import pickle
+    import faiss
+    from src.pipeline.chunker import chunk_documents
+
+
+    retriever = getattr(app.state, "retriever", None)
+    if retriever is None or retriever._index is None:
+        raise HTTPException(status_code=503, detail="Retriever not pre-warmed. Cannot ingest.")
+
+    logger.info("POST /ingest — title='%s', size=%d chars", req.title, len(req.text))
+    
+    # 1. Chunk the document
+    doc = {
+        "text": req.text,
+        "doc_id": "custom_" + req.title[:10],
+        "title": req.title,
+        "source": req.source,
+        "pub_type": req.pub_type,
+        "pub_year": 2026,
+    }
+    chunks = chunk_documents([doc], _cfg)
+    
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Document produced 0 chunks.")
+
+    # 2. Embed the chunks using the same BioBERT model as the retriever
+    from src.pipeline.embedder import encode_texts
+    import numpy as np
+
+    # Reuse already-loaded SentenceTransformer from the retriever to avoid double RAM load
+    if retriever._model is None:
+        retriever._load_model()
+    st_model = retriever._model
+    
+    texts = [c["chunk_text"] for c in chunks]
+    embeddings = np.array(st_model.encode(texts, show_progress_bar=False), dtype=np.float32)
+    faiss.normalize_L2(embeddings)  # Required: index is IndexFlatIP = cosine sim
+
+    # 3. Thread-safe Index Update with atomic disk writes
+    with _faiss_lock:
+        import os
+        idx_path = Path(_cfg["retrieval"]["index_path"])
+        meta_path = Path(_cfg["retrieval"]["metadata_path"])
+        
+        index = retriever._index
+        metadata_store = retriever._metadata
+
+        start_id = len(metadata_store)
+        
+        # Add to in-memory structures
+        for i, chunk in enumerate(chunks):
+            metadata_store[start_id + i] = chunk
+            
+        # Add to FAISS in memory
+        index.add(embeddings)
+        
+        # Atomic FAISS write: write to temp → rename (never leaves a half-written file)
+        idx_tmp = str(idx_path) + ".tmp"
+        faiss.write_index(index, idx_tmp)
+        os.replace(idx_tmp, str(idx_path))
+        
+        # Atomic metadata write
+        meta_tmp = str(meta_path) + ".tmp"
+        with open(meta_tmp, "wb") as f:
+            pickle.dump(metadata_store, f)
+        os.replace(meta_tmp, str(meta_path))
+            
+    logger.info("Successfully injected %d chunks for '%s' into FAISS.", len(chunks), req.title)
+    return {"status": "success", "chunks_added": len(chunks), "title": req.title}

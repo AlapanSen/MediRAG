@@ -84,7 +84,7 @@ def aggregate(
     contra_score = contradiction_result.score if not contradiction_result.error else 1.0
     ragas_score = (ragas_result.score if ragas_result and not ragas_result.error else 0.5)
 
-    # Compute weighted contributions
+    # Compute base weighted contributions
     contributions = {
         "faithfulness_contribution":   round(faith_score  * w["faithfulness"], 4),
         "entity_contribution":         round(entity_score * w["entity_accuracy"], 4),
@@ -93,7 +93,18 @@ def aggregate(
         "ragas_contribution":          round(ragas_score  * w["ragas_composite"], 4),
     }
 
-    composite = sum(contributions.values())
+    base_composite = sum(contributions.values())
+
+    # --- Non-linear Safety Penalties ---
+    # If a response has terrible faithfulness (<= 0.6) or high contradiction (<= 0.6),
+    # linear weighting isn't enough. We slash the final composite to ensure HRS spikes.
+    penalty_multiplier = 1.0
+    if faith_score <= 0.6:
+        penalty_multiplier *= 0.6  # 40% penalty for making things up
+    if contra_score <= 0.6:
+        penalty_multiplier *= 0.6  # 40% penalty for contradicting context
+
+    composite = base_composite * penalty_multiplier
 
     # HRS = round(100 × (1 - composite)), then map to risk band
     hrs = int(round(100 * (1.0 - composite)))

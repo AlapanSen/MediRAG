@@ -34,11 +34,29 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-CONTRADICTION_THRESHOLD = 0.42
+CONTRADICTION_THRESHOLD = 0.75   # Conservative: only flag genuine medical contradictions
+MIN_KEYWORD_OVERLAP = 1          # At least 1 meaningful word in common before running NLI
 MAX_CONTEXT_SENTS = 4   # top N sentences per context chunk
 MAX_PAIRS = 200          # hard cap to keep latency bounded (~2-3s)
 
 _segmenter = pysbd.Segmenter(language="en", clean=False)
+
+# Common stopwords to ignore in overlap check
+_STOPWORDS = {
+    "the", "a", "an", "is", "in", "of", "to", "for", "and", "or", "are",
+    "be", "at", "by", "if", "it", "as", "on", "with", "this", "that",
+    "was", "were", "not", "no", "have", "has", "had", "but", "so", "from",
+    "should", "may", "can", "will", "than", "more", "when", "which", "who",
+    "what", "all", "each", "after", "before", "been", "do", "does", "1",
+    "2", "3", "mg", "iv", "od", "per", "day", "based", "using", "include",
+}
+
+
+def _keyword_overlap(sent_a: str, sent_b: str) -> int:
+    """Count shared content words between two sentences."""
+    tokens_a = {w.lower() for w in sent_a.split() if w.lower() not in _STOPWORDS and len(w) > 2}
+    tokens_b = {w.lower() for w in sent_b.split() if w.lower() not in _STOPWORDS and len(w) > 2}
+    return len(tokens_a & tokens_b)
 
 
 def _segment(text: str) -> list[str]:
@@ -115,15 +133,25 @@ def score_contradiction(
             latency_ms=0,
         )
 
-    # Build pairs (capped at MAX_PAIRS)
+    # Build pairs WITH topical pre-filter (skip unrelated sentence pairs entirely)
     all_pairs: list[tuple[str, str]] = []
     for a_sent in answer_sents:
         for c_sent in context_sents:
-            all_pairs.append((a_sent, c_sent))
+            if _keyword_overlap(a_sent, c_sent) >= MIN_KEYWORD_OVERLAP:
+                all_pairs.append((a_sent, c_sent))
             if len(all_pairs) >= MAX_PAIRS:
                 break
         if len(all_pairs) >= MAX_PAIRS:
             break
+
+    if not all_pairs:
+        # All sentence pairs were topically unrelated — no contradiction possible
+        return EvalResult(
+            module_name="contradiction",
+            score=1.0,
+            details={"total_sentences": len(answer_sents), "checked_pairs": 0, "contradicted_pairs": 0, "pairs": []},
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
 
     # Batch NLI inference
     try:

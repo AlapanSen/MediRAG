@@ -46,6 +46,7 @@ _SYSTEM_PROMPT = (
     "You are MediRAG, a medical AI assistant. "
     "Try to answer the question using the provided context first. "
     "If the context contains the answer, be concise, accurate, and cite specific details from it. "
+    "After each claim drawn from a retrieved source, you MUST cite it inline as [Source: <document title>]. "
     "If the context does NOT contain enough information, YOU MUST STILL ANSWER THE QUESTION based on your general medical knowledge. "
     "When using general knowledge, you MUST start your answer EXACTLY with: 'The retrieved context does not contain this information, but based on general medical knowledge: ' "
     "NEVER just reply 'The context does not contain information'. Always provide the medical answer."
@@ -53,18 +54,26 @@ _SYSTEM_PROMPT = (
 
 
 def _build_prompt(question: str, context_chunks: list[dict]) -> str:
-    """Build the RAG prompt from the question + retrieved chunks."""
+    """Build the RAG prompt from the question + retrieved chunks.
+    
+    Explicitly surfaces title and source for each chunk in the header so the LLM
+    can cite [Source: <title>] inline in its answer.
+    """
     context_parts = []
     for i, chunk in enumerate(context_chunks, 1):
         text = chunk.get("text") or chunk.get("chunk_text", "")
+        title = chunk.get("title", "")
         source = chunk.get("source", "")
         pub_type = chunk.get("pub_type", "")
-        header = f"[Source {i}"
+        # Include title as the primary citation label
+        header_parts = [f"Source {i}"]
+        if title:
+            header_parts.append(f"Title: {title}")
         if pub_type:
-            header += f" | {pub_type}"
-        if source:
-            header += f" | {source}"
-        header += "]"
+            header_parts.append(pub_type)
+        if source and source != title:
+            header_parts.append(source)
+        header = "[" + " | ".join(header_parts) + "]"
         context_parts.append(f"{header}\n{text.strip()}")
 
     context_block = "\n\n".join(context_parts)
@@ -72,7 +81,46 @@ def _build_prompt(question: str, context_chunks: list[dict]) -> str:
         f"{_SYSTEM_PROMPT}\n\n"
         f"CONTEXT:\n{context_block}\n\n"
         f"QUESTION: {question}\n\n"
-        f"ANSWER:"
+        f"ANSWER (cite sources inline as [Source: document title]):"
+    )
+
+
+# Strict prompt — used when first answer fails evaluation (HRS ≥ 60)
+_STRICT_SYSTEM_PROMPT = (
+    "You are MediRAG, a clinical safety assistant under strict mode. "
+    "A previous response was flagged as potentially unsafe or inaccurate. "
+    "You MUST answer ONLY using the information explicitly stated in the CONTEXT below. "
+    "Do NOT use any general medical knowledge, training data, or outside information. "
+    "If the context is insufficient, you MUST say EXACTLY: "
+    "'⚠️ Insufficient evidence in retrieved context to answer safely. Please consult a clinical specialist.' "
+    "NEVER hallucinate drug names, dosages, or clinical recommendations."
+)
+
+
+def _build_strict_prompt(question: str, context_chunks: list[dict]) -> str:
+    """Strict prompt: context-only, used on regeneration after failed evaluation."""
+    context_parts = []
+    for i, chunk in enumerate(context_chunks, 1):
+        text = chunk.get("text") or chunk.get("chunk_text", "")
+        title = chunk.get("title", "")
+        source = chunk.get("source", "")
+        pub_type = chunk.get("pub_type", "")
+        header_parts = [f"Source {i}"]
+        if title:
+            header_parts.append(f"Title: {title}")
+        if pub_type:
+            header_parts.append(pub_type)
+        if source and source != title:
+            header_parts.append(source)
+        header = "[" + " | ".join(header_parts) + "]"
+        context_parts.append(f"{header}\n{text.strip()}")
+
+    context_block = "\n\n".join(context_parts)
+    return (
+        f"{_STRICT_SYSTEM_PROMPT}\n\n"
+        f"CONTEXT:\n{context_block}\n\n"
+        f"QUESTION: {question}\n\n"
+        f"SAFE ANSWER (context-only, cite [Source: title] for every claim):"
     )
 
 
@@ -250,3 +298,40 @@ def generate_answer(
             f"Unknown LLM provider '{provider}'. "
             "Set llm.provider to 'gemini' or 'ollama'."
         )
+
+
+def generate_strict_answer(
+    question: str,
+    context_chunks: list[dict],
+    config: Optional[dict] = None,
+    overrides: Optional[dict] = None,
+) -> str:
+    """
+    Generate a STRICT context-only answer.
+    Called when initial answer fails evaluation (HRS >= 60).
+    The LLM is forbidden from using any training knowledge.
+    """
+    if config is None:
+        config = _load_config()
+
+    effective_llm = dict(config.get("llm", {}))
+    if overrides:
+        if overrides.get("provider"):
+            effective_llm["provider"] = overrides["provider"]
+        if overrides.get("api_key"):
+            effective_llm["gemini_api_key"] = overrides["api_key"]
+        if overrides.get("model"):
+            effective_llm["gemini_model"] = overrides["model"]
+        if overrides.get("ollama_url"):
+            effective_llm["base_url"] = overrides["ollama_url"]
+
+    effective_config = {**config, "llm": effective_llm}
+    provider = effective_llm.get("provider", "gemini").lower()
+    prompt = _build_strict_prompt(question, context_chunks)
+
+    if provider == "gemini":
+        return _generate_gemini(prompt, effective_config)
+    elif provider == "ollama":
+        return _generate_ollama(prompt, effective_config)
+    else:
+        raise RuntimeError(f"Unknown LLM provider '{provider}'.")

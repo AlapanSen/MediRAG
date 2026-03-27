@@ -1,6 +1,8 @@
-# Ignore large databases
-data/raw/
-data/processed/
+# Ignore large databases and generated content
+*.faiss
+faiss.index
+metadata_store.pkl
+data/
 # Python
 __pycache__/
 *.pyc

@@ -1,2 +1,3 @@
-# placeholder — FAISS index + metadata_store.pkl will be stored here
-# These files ARE tracked (not in .gitignore) — see .gitattributes for binary handling
+version https://git-lfs.github.com/spec/v1
+oid sha256:39bfd0ee5fd429c2ecd469f1827155669813fbe5a7e8365fc19bdea13f491651
+size 162

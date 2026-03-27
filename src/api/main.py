@@ -310,9 +310,20 @@ def query(req: QueryRequest) -> QueryResponse:
     logger.info("Retrieved %d chunks (top score=%.4f)", len(context_chunks),
                 raw_results[0][2] if raw_results else 0.0)
 
-    # Step 2: Generate answer via Mistral
+    # Convert request overrides into a dict for generator
+    llm_overrides = {}
+    if req.llm_provider:
+        llm_overrides["provider"] = req.llm_provider
+    if req.llm_api_key:
+        llm_overrides["api_key"] = req.llm_api_key
+    if req.llm_model:
+        llm_overrides["model"] = req.llm_model
+    if req.ollama_url:
+        llm_overrides["ollama_url"] = req.ollama_url
+
+    # Step 2: Generate answer via LLM (Gemini or Ollama)
     try:
-        answer = generate_answer(req.question, context_chunks, _cfg)
+        answer = generate_answer(req.question, context_chunks, _cfg, overrides=llm_overrides)
     except RuntimeError as exc:
         raise HTTPException(status_code=503,
             detail=f"LLM generation failed: {exc}") from exc

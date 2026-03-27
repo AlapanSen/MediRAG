@@ -1,7 +1,6 @@
-# Ignore large raw data and processed chunks (NOT data/index/ — that is tracked)
+# Ignore large databases
 data/raw/
 data/processed/
-
 # Python
 __pycache__/
 *.pyc

@@ -141,7 +141,25 @@ class QueryRequest(BaseModel):
     )
     run_ragas: bool = Field(
         default=False,
-        description="Run RAGAS evaluation (requires Ollama — adds ~10s)",
+        description="Run RAGAS evaluation (requires LLM backend)",
+    )
+    # Per-request LLM overrides — if not set, server config.yaml values are used
+    # This makes the eval engine portable: callers bring their own key + model
+    llm_provider: Optional[str] = Field(
+        default=None,
+        description="LLM provider override: 'gemini' or 'ollama'"
+    )
+    llm_api_key: Optional[str] = Field(
+        default=None,
+        description="API key override (e.g. Gemini key). Not logged or stored."
+    )
+    llm_model: Optional[str] = Field(
+        default=None,
+        description="Model name override (e.g. 'gemini-2.5-flash-lite')"
+    )
+    ollama_url: Optional[str] = Field(
+        default=None,
+        description="Ollama base URL override (e.g. 'http://localhost:8080')"
     )
 
 

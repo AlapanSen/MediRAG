@@ -53,11 +53,14 @@ def ingest_pubmedqa(max_samples: int = 500) -> list[dict[str, Any]]:
 
     pub_type = "research_abstract" → Tier 3 (SRS FR-03b)
     """
-    logger.info("Loading PubMedQA (max %d QA pairs)...", max_samples)
+    # Use 'pqa_artificial' (211k rows) if asking for more than 1000,
+    # as 'pqa_labeled' only has 1000 rows.
+    split_name = "pqa_artificial" if max_samples > 1000 else "pqa_labeled"
+    logger.info("Loading PubMedQA split='%s' (max %d QA pairs)...", split_name, max_samples)
     try:
         from datasets import load_dataset
         dataset = load_dataset(
-            "pubmed_qa", "pqa_labeled", split="train", trust_remote_code=True
+            "pubmed_qa", split_name, split="train", trust_remote_code=True
         )
     except Exception as exc:
         logger.error("Failed to load PubMedQA from HuggingFace: %s", exc)

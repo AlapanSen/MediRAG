@@ -44,10 +44,11 @@ def _load_config() -> dict:
 
 _SYSTEM_PROMPT = (
     "You are MediRAG, a medical AI assistant. "
-    "Answer the question using ONLY the provided context. "
-    "Be concise, accurate, and cite specific details from the context. "
-    "If the context does not contain enough information, say so explicitly. "
-    "Do NOT invent facts, dosages, or clinical recommendations not present in the context."
+    "Try to answer the question using the provided context first. "
+    "If the context contains the answer, be concise, accurate, and cite specific details from it. "
+    "If the context does NOT contain enough information, YOU MUST STILL ANSWER THE QUESTION based on your general medical knowledge. "
+    "When using general knowledge, you MUST start your answer EXACTLY with: 'The retrieved context does not contain this information, but based on general medical knowledge: ' "
+    "NEVER just reply 'The context does not contain information'. Always provide the medical answer."
 )
 
 
@@ -71,7 +72,7 @@ def _build_prompt(question: str, context_chunks: list[dict]) -> str:
         f"{_SYSTEM_PROMPT}\n\n"
         f"CONTEXT:\n{context_block}\n\n"
         f"QUESTION: {question}\n\n"
-        f"ANSWER (based only on the context above):"
+        f"ANSWER:"
     )
 
 
@@ -196,18 +197,24 @@ def generate_answer(
     question: str,
     context_chunks: list[dict],
     config: Optional[dict] = None,
+    overrides: Optional[dict] = None,
 ) -> str:
     """
     Generate a grounded medical answer.
 
-    Provider is selected from config.yaml → llm.provider:
-      "gemini"  → Google Gemini API (default)
-      "ollama"  → Local Ollama
+    Provider is selected from config.yaml → llm.provider, but can be
+    overridden per-request via the `overrides` dict. This makes the eval
+    engine portable — callers bring their own API key and model.
 
     Args:
         question       : User's medical question.
         context_chunks : Retrieved context chunks (dicts with 'text' key).
         config         : Config dict (loaded from config.yaml if None).
+        overrides      : Per-request overrides. Supported keys:
+                           provider   → "gemini" or "ollama"
+                           api_key    → Gemini API key
+                           model      → model name (e.g. "gemini-2.5-flash-lite")
+                           ollama_url → Ollama base URL
 
     Returns:
         Generated answer string.
@@ -218,15 +225,28 @@ def generate_answer(
     if config is None:
         config = _load_config()
 
-    provider = config.get("llm", {}).get("provider", "gemini").lower()
+    # Build effective config: server config as base, overrides win
+    effective_llm = dict(config.get("llm", {}))
+    if overrides:
+        if overrides.get("provider"):
+            effective_llm["provider"] = overrides["provider"]
+        if overrides.get("api_key"):
+            effective_llm["gemini_api_key"] = overrides["api_key"]
+        if overrides.get("model"):
+            effective_llm["gemini_model"] = overrides["model"]
+        if overrides.get("ollama_url"):
+            effective_llm["base_url"] = overrides["ollama_url"]
+
+    effective_config = {**config, "llm": effective_llm}
+    provider = effective_llm.get("provider", "gemini").lower()
     prompt = _build_prompt(question, context_chunks)
 
     if provider == "gemini":
-        return _generate_gemini(prompt, config)
+        return _generate_gemini(prompt, effective_config)
     elif provider == "ollama":
-        return _generate_ollama(prompt, config)
+        return _generate_ollama(prompt, effective_config)
     else:
         raise RuntimeError(
             f"Unknown LLM provider '{provider}'. "
-            "Set llm.provider to 'gemini' or 'ollama' in config.yaml."
+            "Set llm.provider to 'gemini' or 'ollama'."
         )
